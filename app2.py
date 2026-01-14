@@ -12,8 +12,12 @@ from langchain_groq import ChatGroq
 from langchain.chains.summarize import load_summarize_chain
 from langchain.schema import Document
 from langchain_community.document_loaders import UnstructuredURLLoader
-
+from langchain_community.document_loaders import PyPDFLoader, UnstructuredFileLoader
 from youtube_transcript_api import YouTubeTranscriptApi
+
+import requests
+import tempfile
+import os
 
 # ---------------- STREAMLIT UI ----------------
 st.set_page_config(
@@ -66,6 +70,116 @@ def load_youtube_transcript(url: str):
 
     return [Document(page_content=text)]
 
+def load_google_drive_file(url: str):
+    """
+    Loads publicly shared Google Docs or Google Drive PDFs.
+    Raises clear error if permission is denied.
+    """
+    session = requests.Session()
+
+    # -------- Google Docs (text export) --------
+    if "docs.google.com/document" in url:
+        file_id = re.search(r"/d/([^/]+)", url)
+        if not file_id:
+            raise ValueError("Invalid Google Docs URL")
+
+        file_id = file_id.group(1)
+        export_url = f"https://docs.google.com/document/d/{file_id}/export?format=txt"
+
+        resp = session.get(export_url, timeout=15)
+
+        if resp.status_code != 200 or "DOCTYPE html" in resp.text:
+            raise PermissionError(
+                "Cannot access Google Doc. "
+                "Make sure it is shared as: Anyone with the link → Viewer."
+            )
+
+        text = resp.text.strip()
+        if not text:
+            raise ValueError("Google Doc is empty or unreadable.")
+
+        return [Document(page_content=text)]
+
+    # -------- Google Drive file (PDF etc.) --------
+    if "drive.google.com/file" in url:
+        file_id = re.search(r"/d/([^/]+)", url)
+        if not file_id:
+            raise ValueError("Invalid Google Drive file URL")
+
+        file_id = file_id.group(1)
+        download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+
+        resp = session.get(download_url, timeout=20)
+
+        if resp.status_code != 200 or "DOCTYPE html" in resp.text[:200]:
+            raise PermissionError(
+                "Cannot access Google Drive file. "
+                "Ensure it is shared publicly (Viewer access)."
+            )
+
+        # Save temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
+            f.write(resp.content)
+            temp_path = f.name
+
+        loader = PyPDFLoader(temp_path)
+        docs = loader.load()
+
+
+from langchain_community.document_loaders import PyPDFLoader, UnstructuredFileLoader
+import requests, tempfile, os, re
+
+import requests, tempfile, os, re
+from langchain_community.document_loaders import PyPDFLoader, UnstructuredFileLoader
+from langchain.schema import Document
+
+def load_google_drive_shared_file(url: str):
+    match = re.search(r"/d/([^/]+)", url)
+    if not match:
+        raise ValueError("Invalid Google Drive file URL")
+
+    file_id = match.group(1)
+    download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+
+    response = requests.get(download_url, timeout=20)
+    content_type = response.headers.get("Content-Type", "").lower()
+
+    # Permission / login HTML
+    if response.status_code != 200 or "text/html" in content_type:
+        raise PermissionError(
+            "Cannot access Google Drive file. "
+            "Set sharing to: Anyone with the link → Viewer."
+        )
+
+    # 🔑 EXTENSION DECISION (STRICT)
+    if "application/pdf" in content_type:
+        suffix = ".pdf"
+        is_pdf = True
+    else:
+        suffix = ".docx"
+        is_pdf = False
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+        f.write(response.content)
+        temp_path = f.name
+
+    try:
+        # 🔥 THIS LINE IS THE ENTIRE FIX
+        if is_pdf:
+            loader = PyPDFLoader(temp_path)              # ✅ SAFE
+        else:
+            loader = UnstructuredFileLoader(temp_path)  # DOC/DOCX ONLY
+
+        docs = loader.load()
+
+        if not docs or not docs[0].page_content.strip():
+            raise ValueError("Downloaded file has no readable text.")
+
+        return docs
+
+    finally:
+        os.unlink(temp_path)
+
 # ---------------- BUTTON ----------------
 if st.button("Summarize the Content from YT or Website"):
 
@@ -79,6 +193,17 @@ if st.button("Summarize the Content from YT or Website"):
             # -------- LOAD CONTENT --------
             if "youtube.com" in generic_url or "youtu.be" in generic_url:
                 docs = load_youtube_transcript(generic_url)
+
+            # elif "drive.google.com/file" in generic_url:
+            #     docs = load_google_drive_shared_file(generic_url)
+
+            elif "docs.google.com/document" in generic_url:
+                docs = load_google_drive_file(generic_url)
+
+            elif generic_url.lower().endswith(".pdf"):
+                loader = PyPDFLoader(generic_url)
+                docs = loader.load()
+            
             else:
                 loader = UnstructuredURLLoader(
                     urls=[generic_url],
