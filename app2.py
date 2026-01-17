@@ -95,14 +95,23 @@ def load_youtube_transcript(url: str):
         cmd = [
             "yt-dlp",
             "--skip-download",
-            "--write-auto-sub",
-            "--sub-lang", "en",
+            "--write-subs",
+            "--write-auto-subs",
+            "--sub-langs", "en",
             "--sub-format", "json3",
+            "--no-check-certificate",
+            "--no-warnings",
             "-o", output_template,
             url,
         ]
 
-        subprocess.run(cmd, check=True, capture_output=True)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                "yt-dlp failed to fetch subtitles.\n"
+                f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
+            )
 
         files = os.listdir(tmpdir)
         sub_files = [f for f in files if f.endswith(".json3")]
