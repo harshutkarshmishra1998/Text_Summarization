@@ -3,22 +3,26 @@
 # ================================
 
 import re
-# import api_keys
+import os
+import json
+import tempfile
+import subprocess
+import requests
+
 import api_key_prod
 import validators
 import streamlit as st
 
-from langchain.prompts import PromptTemplate
-from langchain_groq import ChatGroq
+from langchain_core.prompts import PromptTemplate
+from langchain_core.documents import Document
 from langchain.chains.summarize import load_summarize_chain
-from langchain.schema import Document
-from langchain_community.document_loaders import UnstructuredURLLoader
-from langchain_community.document_loaders import PyPDFLoader, UnstructuredFileLoader
-from youtube_transcript_api import YouTubeTranscriptApi
+from langchain_groq import ChatGroq
 
-import requests
-import tempfile
-import os
+from langchain_community.document_loaders import (
+    UnstructuredURLLoader,
+    PyPDFLoader,
+    UnstructuredFileLoader,
+)
 
 # ---------------- STREAMLIT UI ----------------
 st.set_page_config(
@@ -34,8 +38,8 @@ generic_url = st.text_input("URL", label_visibility="collapsed")
 # ---------------- LLM ----------------
 llm = ChatGroq(
     model="llama-3.1-8b-instant",
-    streaming=False,   # 🔑 REQUIRED
-    temperature=0.2
+    streaming=False,
+    temperature=0.2,
 )
 
 # ---------------- PROMPT ----------------
@@ -48,37 +52,86 @@ Content:
 
 prompt = PromptTemplate(
     template=prompt_template,
-    input_variables=["text"]
+    input_variables=["text"],
 )
 
-# ---------------- YOUTUBE TRANSCRIPT ----------------
+# ---------------- YOUTUBE TRANSCRIPT (CLOUD SAFE) ----------------
 def load_youtube_transcript(url: str):
+    """
+    Works locally and on Streamlit Cloud.
+    Uses youtube_transcript_api first, falls back to yt-dlp if blocked.
+    """
+
     match = re.search(r"(?:v=|youtu\.be/)([^&?/]+)", url)
     if not match:
         raise ValueError("Invalid YouTube URL")
 
     video_id = match.group(1)
 
-    transcript_data = YouTubeTranscriptApi().list(video_id)
-
+    # ----- Method 1: youtube_transcript_api (local IPs) -----
     try:
-        transcript = transcript_data.find_manually_created_transcript(["en"])
-    except:
-        transcript = transcript_data.find_generated_transcript(["en"])
+        from youtube_transcript_api import YouTubeTranscriptApi
 
-    transcript = transcript.fetch()
-    text = " ".join(chunk.text for chunk in transcript)
+        transcript_data = YouTubeTranscriptApi().list(video_id)
 
-    return [Document(page_content=text)]
+        try:
+            transcript = transcript_data.find_manually_created_transcript(["en"])
+        except:
+            transcript = transcript_data.find_generated_transcript(["en"])
 
+        transcript = transcript.fetch()
+        text = " ".join(chunk.text for chunk in transcript)
+
+        if text.strip():
+            return [Document(page_content=text)]
+
+    except Exception:
+        pass  # Cloud IP blocked → fallback
+
+    # ----- Method 2: yt-dlp fallback (cloud safe) -----
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_template = os.path.join(tmpdir, "%(id)s.%(ext)s")
+
+        cmd = [
+            "yt-dlp",
+            "--skip-download",
+            "--write-auto-sub",
+            "--sub-lang", "en",
+            "--sub-format", "json3",
+            "-o", output_template,
+            url,
+        ]
+
+        subprocess.run(cmd, check=True, capture_output=True)
+
+        files = os.listdir(tmpdir)
+        sub_files = [f for f in files if f.endswith(".json3")]
+
+        if not sub_files:
+            raise RuntimeError("No subtitles available for this video.")
+
+        sub_path = os.path.join(tmpdir, sub_files[0])
+
+        with open(sub_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        events = data.get("events", [])
+        text = " ".join(
+            seg["utf8"]
+            for event in events
+            for seg in event.get("segs", [])
+        )
+
+        if not text.strip():
+            raise RuntimeError("Transcript is empty.")
+
+        return [Document(page_content=text)]
+
+# ---------------- GOOGLE DOCS / DRIVE ----------------
 def load_google_drive_file(url: str):
-    """
-    Loads publicly shared Google Docs or Google Drive PDFs.
-    Raises clear error if permission is denied.
-    """
     session = requests.Session()
 
-    # -------- Google Docs (text export) --------
+    # Google Docs
     if "docs.google.com/document" in url:
         file_id = re.search(r"/d/([^/]+)", url)
         if not file_id:
@@ -91,17 +144,16 @@ def load_google_drive_file(url: str):
 
         if resp.status_code != 200 or "DOCTYPE html" in resp.text:
             raise PermissionError(
-                "Cannot access Google Doc. "
-                "Make sure it is shared as: Anyone with the link → Viewer."
+                "Cannot access Google Doc. Share as: Anyone with link → Viewer."
             )
 
         text = resp.text.strip()
         if not text:
-            raise ValueError("Google Doc is empty or unreadable.")
+            raise ValueError("Google Doc is empty.")
 
         return [Document(page_content=text)]
 
-    # -------- Google Drive file (PDF etc.) --------
+    # Google Drive files
     if "drive.google.com/file" in url:
         file_id = re.search(r"/d/([^/]+)", url)
         if not file_id:
@@ -112,74 +164,34 @@ def load_google_drive_file(url: str):
 
         resp = session.get(download_url, timeout=20)
 
-        if resp.status_code != 200 or "DOCTYPE html" in resp.text[:200]:
-            raise PermissionError(
-                "Cannot access Google Drive file. "
-                "Ensure it is shared publicly (Viewer access)."
-            )
+        if resp.status_code != 200:
+            raise PermissionError("Cannot access Google Drive file.")
 
-        # Save temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as f:
+        content_type = resp.headers.get("Content-Type", "").lower()
+
+        suffix = ".pdf" if "application/pdf" in content_type else ".docx"
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
             f.write(resp.content)
             temp_path = f.name
 
-        loader = PyPDFLoader(temp_path)
-        docs = loader.load()
+        try:
+            if suffix == ".pdf":
+                loader = PyPDFLoader(temp_path)
+            else:
+                loader = UnstructuredFileLoader(temp_path)
 
+            docs = loader.load()
 
-from langchain_community.document_loaders import PyPDFLoader, UnstructuredFileLoader
-import requests, tempfile, os, re
+            if not docs or not docs[0].page_content.strip():
+                raise ValueError("File contains no readable text.")
 
-import requests, tempfile, os, re
-from langchain_community.document_loaders import PyPDFLoader, UnstructuredFileLoader
-from langchain.schema import Document
+            return docs
 
-def load_google_drive_shared_file(url: str):
-    match = re.search(r"/d/([^/]+)", url)
-    if not match:
-        raise ValueError("Invalid Google Drive file URL")
+        finally:
+            os.unlink(temp_path)
 
-    file_id = match.group(1)
-    download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
-
-    response = requests.get(download_url, timeout=20)
-    content_type = response.headers.get("Content-Type", "").lower()
-
-    # Permission / login HTML
-    if response.status_code != 200 or "text/html" in content_type:
-        raise PermissionError(
-            "Cannot access Google Drive file. "
-            "Set sharing to: Anyone with the link → Viewer."
-        )
-
-    # 🔑 EXTENSION DECISION (STRICT)
-    if "application/pdf" in content_type:
-        suffix = ".pdf"
-        is_pdf = True
-    else:
-        suffix = ".docx"
-        is_pdf = False
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-        f.write(response.content)
-        temp_path = f.name
-
-    try:
-        # 🔥 THIS LINE IS THE ENTIRE FIX
-        if is_pdf:
-            loader = PyPDFLoader(temp_path)              # ✅ SAFE
-        else:
-            loader = UnstructuredFileLoader(temp_path)  # DOC/DOCX ONLY
-
-        docs = loader.load()
-
-        if not docs or not docs[0].page_content.strip():
-            raise ValueError("Downloaded file has no readable text.")
-
-        return docs
-
-    finally:
-        os.unlink(temp_path)
+    raise ValueError("Unsupported Google Drive URL")
 
 # ---------------- BUTTON ----------------
 if st.button("Summarize the Content from YT or Website"):
@@ -195,16 +207,13 @@ if st.button("Summarize the Content from YT or Website"):
             if "youtube.com" in generic_url or "youtu.be" in generic_url:
                 docs = load_youtube_transcript(generic_url)
 
-            # elif "drive.google.com/file" in generic_url:
-            #     docs = load_google_drive_shared_file(generic_url)
-
-            elif "docs.google.com/document" in generic_url:
+            elif "docs.google.com/document" in generic_url or "drive.google.com/file" in generic_url:
                 docs = load_google_drive_file(generic_url)
 
             elif generic_url.lower().endswith(".pdf"):
                 loader = PyPDFLoader(generic_url)
                 docs = loader.load()
-            
+
             else:
                 loader = UnstructuredURLLoader(
                     urls=[generic_url],
@@ -215,7 +224,7 @@ if st.button("Summarize the Content from YT or Website"):
                             "AppleWebKit/537.36 (KHTML, like Gecko) "
                             "Chrome/120.0.0.0 Safari/537.36"
                         )
-                    }
+                    },
                 )
                 docs = loader.load()
 
@@ -227,12 +236,12 @@ if st.button("Summarize the Content from YT or Website"):
             chain = load_summarize_chain(
                 llm=llm,
                 chain_type="stuff",
-                prompt=prompt
+                prompt=prompt,
             )
 
             result = chain.invoke(
                 {"input_documents": docs},
-                return_only_outputs=True
+                return_only_outputs=True,
             )
 
             st.success(result["output_text"])
