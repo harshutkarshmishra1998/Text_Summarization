@@ -8,10 +8,10 @@ import api_key_prod
 import validators
 import streamlit as st
 
-from langchain.prompts import PromptTemplate
+from langchain_core import PromptTemplate
 from langchain_groq import ChatGroq
-from langchain.chains.summarize import load_summarize_chain
-from langchain.schema import Document
+from langchain_core import load_summarize_chain
+from langchain_core.documents import Document
 from langchain_community.document_loaders import UnstructuredURLLoader
 from langchain_community.document_loaders import PyPDFLoader, UnstructuredFileLoader
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -132,7 +132,7 @@ import requests, tempfile, os, re
 
 import requests, tempfile, os, re
 from langchain_community.document_loaders import PyPDFLoader, UnstructuredFileLoader
-from langchain.schema import Document
+from langchain_core.documents import Document
 
 def load_google_drive_shared_file(url: str):
     match = re.search(r"/d/([^/]+)", url)
